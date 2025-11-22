@@ -1,140 +1,140 @@
+/**
+ * @file SmartSwitch.ino
+ * @brief 6-channel relay controller with XiaoZhi MCP integration.
+ * 
+ * Features:
+ * - Physical switch control (active-low, with debouncing)
+ * - Remote control via XiaoZhi LLM (tool_call: relay_control, relay_status)
+ * - One-step activation using 6-digit agent code
+ * - Automatic token persistence (NVS)
+ * - Non-blocking switch polling
+ * 
+ * Wiring:
+ *   Switches: pins 1–6 (internal pull-up, active LOW)
+ *   Relays:   pins 21, 45, 46, 38, 39, 40 (active HIGH)
+ */
+
+#include <Arduino.h>
 #include <WiFi.h>
-#include <WebSocketMCP.h>
+#include <WiFiClientSecure.h>
+#include "WebSocketMCP.h"
 
-// WiFi configuration
-const char* ssid = "your-ssid";
-const char* password = "your-password";
+// === Configuration ===
+const char* WIFI_SSID = "your-ssid";
+const char* WIFI_PASS = "your-password";
+const char* AGENT_CODE = "Fx5L4pDZqw";  // ← Get from XiaoZhi dashboard
 
-// MCP server configuration
-const char* mcpEndpoint = "ws://your-mcp-server:port/path";
+// Relay & switch pins (adjust for your board)
+constexpr int SWITCH_PINS[] = {1, 2, 3, 4, 5, 6};
+constexpr int RELAY_PINS[] = {21, 45, 46, 38, 39, 40};
+constexpr size_t NUM_RELAYS = 6;
 
-// Create a WebSocketMCP instance
-WebSocketMCP mcpClient;
+// State tracking
+bool relayStates[NUM_RELAYS] = {false};
+unsigned long lastDebounceTime[NUM_RELAYS] = {0};
+constexpr unsigned long DEBOUNCE_DELAY_MS = 50;
 
-// Smart switch pin definition
-const int SWITCH_PINS[] = {1, 2, 3, 4, 5, 6};  // Switch input pins
-const int RELAY_PINS[] = {21, 45, 46, 38, 39, 40};  // Relay output pin
-bool relayStates[6] = {false, false, false, false, false, false};  // Relay status
-unsigned long lastDebounceTime[6] = {0};  // Last anti-shake time
-const unsigned long debounceDelay = 50;  // Anti-shake delay (milliseconds)
+// === Global objects ===
+WiFiClientSecure client;
+WebSocketMCP mcp(client);
 
-// Connection status callback function
-void onConnectionStatus(bool connected) {
+// === Helper: control relay safely ===
+void setRelay(size_t index, bool on) {
+  if (index >= NUM_RELAYS) return;
+  relayStates[index] = on;
+  digitalWrite(RELAY_PINS[index], on ? HIGH : LOW);
+  Serial.printf("[RELAY] #%zu → %s\n", index + 1, on ? "ON" : "OFF");
+}
+
+// === Callback: MCP connection & tool registration ===
+void onMcpConnect(bool connected) {
   if (connected) {
-    Serial.println("[MCP] Connected to the server");
-    // Register tool after successful connection
-    registerMcpTools();
-  } else {
-    Serial.println("[MCP] Disconnect from the server");
+    Serial.println("[MCP] ✅ Connected — registering tools...");
+
+    // Tool 1: control single relay
+    mcp.registerTool(
+      "relay_control",
+      "Control a specific relay (1-6)",
+      R"({"type":"object","properties":{"relayIndex":{"type":"integer","minimum":1,"maximum":6},"state":{"type":"boolean"}},"required":["relayIndex","state"]})",
+      [](const char* args) -> ToolResponse {
+        // Lightweight parsing — no heap allocation
+        int idx = -1, state = -1;
+        if (sscanf(args, R"({"relayIndex":%d,"state":%d)", &idx, &state) == 2 && idx >= 1 && idx <= 6) {
+          setRelay(idx - 1, state == 1);
+          return ToolResponse(false, R"({"success":true})");
+        }
+        return ToolResponse(true, R"({"error":"invalid_params"})");
+      }
+    );
+
+    // Tool 2: get all relay states
+    mcp.registerTool(
+      "relay_status",
+      "Get current state of all 6 relays",
+      R"({"type":"object","properties":{}})",
+      [](const char* args) -> ToolResponse {
+        // Build JSON response on stack
+        char response[256];
+        int len = snprintf(response, sizeof(response),
+          R"({"success":true,"relays":[)");
+        for (size_t i = 0; i < NUM_RELAYS && len < 240; i++) {
+          if (i > 0) response[len++] = ',';
+          len += snprintf(response + len, sizeof(response) - len,
+            R"({"index":%u,"state":%s})", i + 1, relayStates[i] ? "true" : "false");
+        }
+        if (len < 250) strcpy(response + len, "]}");
+        return ToolResponse(false, response);
+      }
+    );
+
+    Serial.println("[MCP] ✅ Tools registered");
   }
 }
 
-// Relay control function
-void controlRelay(int relayIndex, bool state) {
-  if (relayIndex >= 0 && relayIndex < 6) {
-    relayStates[relayIndex] = state;
-    digitalWrite(RELAY_PINS[relayIndex], state ? HIGH : LOW);
-    Serial.printf("[Relay] Control relay %d: %s\n", relayIndex + 1, state ? "open" : "close");
-  }
-}
-
-// Check switch status
-void checkSwitches() {
-  for (int i = 0; i < 6; i++) {
-    int switchState = digitalRead(SWITCH_PINS[i]);
-    unsigned long currentTime = millis();
-
-    // Anti-shake treatment
-    if (switchState != relayStates[i] && (currentTime - lastDebounceTime[i] > debounceDelay)) {
-      lastDebounceTime[i] = currentTime;
-      // The switch is active low
-      if (switchState == LOW) {
-        controlRelay(i, !relayStates[i]);
-      }
-    }
-  }
-}
-
-// Register MCP Tools
-void registerMcpTools() {
-  // Register Relay Control Tool
-  mcpClient.registerTool(
-    "relay_control",
-    "Control six-channel relay",
-    "{\"type\":\"object\",\"properties\":{\"relayIndex\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":6},\"state\":{\"type\":\"boolean\"}},\"required\":[\"relayIndex\",\"state\"]}",
-    [](const String& args) {
-      DynamicJsonDocument doc(256);
-      deserializeJson(doc, args);
-      
-      int relayIndex = doc["relayIndex"].as<int>() - 1;  // Convert to 0-based index
-      bool state = doc["state"].as<bool>();
-      
-      if (relayIndex >= 0 && relayIndex < 6) {
-        controlRelay(relayIndex, state);
-        return WebSocketMCP::ToolResponse("{\"success\":true,\"relayIndex\":" + String(relayIndex + 1) + ",\"state\":" + (state ? "true" : "false") + "}");
-      } else {
-        return WebSocketMCP::ToolResponse("{\"success\":false,\"error\":\"Invalid relay index\"}", true);
-      }
-    }
-  );
-  Serial.println("[MCP] Relay Control Tool Registered")l Tool Registered");
-
-  // Register relay status query tool
-  mcpClient.registerTool(
-    "relay_status",
-    "Query the status of six relays",
-    "{\"type\":\"object\",\"properties\":{}}",
-    [](const String& args) {
-      String result = "{\"success\":true,\"relays\":[";
-      for (int i = 0; i < 6; i++) {
-        if (i > 0) result += ",";
-        result += "{\"index\":" + String(i + 1) + ",\"state\":" + (relayStates[i] ? "true" : "false") + "}";
-      }
-      result += "]}";
-      return WebSocketMCP::ToolResponse(result);
-    }
-  );
-  Serial.println("[MCP] Relay status query tool registered");
-}
-
+// === Setup ===
 void setup() {
   Serial.begin(115200);
 
-  // Initialize switch pin (input pull-up)
-  for (int i = 0; i < 6; i++) {
+  // Initialize switches (active-low, pull-up)
+  for (size_t i = 0; i < NUM_RELAYS; i++) {
     pinMode(SWITCH_PINS[i], INPUT_PULLUP);
   }
 
-  // Initialize relay pin (output, initial shutdown)
-  for (int i = 0; i < 6; i++) {
+  // Initialize relays (off by default)
+  for (size_t i = 0; i < NUM_RELAYS; i++) {
     pinMode(RELAY_PINS[i], OUTPUT);
     digitalWrite(RELAY_PINS[i], LOW);
-    relayStates[i] = false;
   }
 
   // Connect to WiFi
-  Serial.print("Connect to WiFi:");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("[WIFI] Connecting to '%s'...\n", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  
-  Serial.println("WiFi is connected");
-  Serial.println("IP address:" + WiFi.localIP().toString());
+  Serial.printf("\n[WIFI] ✅ Connected. IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // Initialize the MCP client
-  mcpClient.begin(mcpEndpoint, onConnectionStatus);
+  // Start XiaoZhi activation
+  Serial.printf("[MCP] 🔑 Starting activation with agent code: %s\n", AGENT_CODE);
+  mcp.beginWithAgentCode(AGENT_CODE, onMcpConnect);
 }
 
+// === Non-blocking switch debouncer ===
+void checkSwitches() {
+  unsigned long now = millis();
+  for (size_t i = 0; i < NUM_RELAYS; i++) {
+    int reading = digitalRead(SWITCH_PINS[i]);  // Active LOW
+    if (reading == LOW && (now - lastDebounceTime[i]) > DEBOUNCE_DELAY_MS) {
+      lastDebounceTime[i] = now;
+      setRelay(i, !relayStates[i]);  // Toggle
+    }
+  }
+}
+
+// === Loop ===
 void loop() {
-  // Handle MCP client events
-  mcpClient.loop();
-  
-  // Check switch status
-  checkSwitches();
-  
-  delay(10);
+  mcp.loop();       // Handles MCP protocol, reconnection, activation
+  checkSwitches();  // Poll switches non-blocking
+  delay(10);        // Gentle yield
 }

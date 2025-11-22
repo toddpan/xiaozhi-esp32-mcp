@@ -1,86 +1,75 @@
+/**
+ * @file Basic_Example.ino
+ * @brief Minimal XiaoZhi MCP client — activation + LED control in under 40 lines.
+ * 
+ * How it works:
+ * 1. Connects to WiFi
+ * 2. Starts activation with 6-digit agent code (e.g., "Fx5L4pDZqw")
+ * 3. After activation on https://xiaozhi.me, token is saved to NVS
+ * 4. Device reconnects automatically — no manual token handling
+ * 5. Registers `led_control` tool for LLM interaction
+ */
+
+#include <Arduino.h>
 #include <WiFi.h>
-#include <WebSocketMCP.h>
+#include <WiFiClientSecure.h>
+#include "WebSocketMCP.h"
 
-#define LED_BUILTIN 2
+// === Configuration ===
+const char* WIFI_SSID = "your-ssid";
+const char* WIFI_PASS = "your-password";
+const char* AGENT_CODE = "Fx5L4pDZqw";  // ← Get from XiaoZhi device dashboard
 
-// WiFi configuration
-const char* ssid = "your-ssid";
-const char* password = "your-password";
+#define LED_PIN 2  // ESP32 onboard LED
 
-// MCP server configuration
-const char* mcpEndpoint = "ws://your-mcp-server:port/path";
+// === Global objects ===
+WiFiClientSecure client;
+WebSocketMCP mcp(client);
 
-// Create a WebSocketMCP instance
-WebSocketMCP mcpClient;
-
-// Connection status callback function
-void onConnectionStatus(bool connected) {
+// === Callback: connection state & tool registration ===
+void onMcpConnect(bool connected) {
   if (connected) {
-    Serial.println("[MCP] Connected to the server");
-    // Register tool after successful connection
-    registerMcpTools();
-  } else {
-    Serial.println("[MCP] Disconnect from the server");
+    Serial.println("[MCP] ✅ Connected — registering tools...");
+
+    mcp.registerTool(
+      "led_control",
+      "Toggle ESP32 onboard LED",
+      R"({"type":"object","properties":{"state":{"type":"string","enum":["on","off"]}},"required":["state"]})",
+      [](const char* args) -> ToolResponse {
+        if (strstr(args, "\"state\":\"on\"")) {
+          digitalWrite(LED_PIN, HIGH);
+          return ToolResponse(false, "{\"success\":true}");
+        } else if (strstr(args, "\"state\":\"off\"")) {
+          digitalWrite(LED_PIN, LOW);
+          return ToolResponse(false, "{\"success\":true}");
+        }
+        return ToolResponse(true, "{\"error\":\"invalid_state\"}");
+      }
+    );
   }
 }
 
-// Register MCP Tools
-void registerMcpTools() {
-  // Register a simple LED control tool
-  mcpClient.registerTool(
-    "led_blink",
-    "Control ESP32 onboard LEDs",
-    "{\"type\":\"object\",\"properties\":{\"state\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"blink\"]}},\"required\":[\"state\"]}",
-    [](const String& args) {
-      DynamicJsonDocument doc(256);
-      deserializeJson(doc, args);
-      String state = doc["state"].as<String>();
-      
-      if (state == "on") {
-        digitalWrite(LED_BUILTIN, HIGH);
-      } else if (state == "off") {
-        digitalWrite(LED_BUILTIN, LOW);
-      } else if (state == "blink") {
-        for (int i = 0; i < 5; i++) {
-          digitalWrite(LED_BUILTIN, HIGH);
-          delay(200);
-          digitalWrite(LED_BUILTIN, LOW);
-          delay(200);
-        }
-      }
-      
-      return WebSocketMCP::ToolResponse("{\"success\":true,\"state\":\"" + state + "\"}");
-    }
-  );
-  Serial.println("[MCP] LED Control Tool Registered");
-}
-
+// === Setup ===
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
-  // Connect to WiFi
-  Serial.print("Connect to WiFi:")WiFi:");
-  Serial.println(ssid);
-  WiFi.begin(ssid, password);
-  
+  // WiFi
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  
-  Serial.println("WiFi is connected");
-  Serial.println("IP address:" + WiFi.localIP().toString());
+  Serial.println("\n[WiFi] ✅ Connected");
 
-  // Initialize the MCP client
-  mcpClient.begin(mcpEndpoint, onConnectionStatus);
+  // XiaoZhi activation (one-time; token saved to NVS)
+  Serial.printf("[MCP] 🔑 Starting activation with code: %s\n", AGENT_CODE);
+  mcp.beginWithAgentCode(AGENT_CODE, onMcpConnect);
 }
 
+// === Loop ===
 void loop() {
-  // Handle MCP client events
-  mcpClient.loop();
-  
-  // Other codes...
+  mcp.loop();  // Handles reconnect, ping, messages, activation flow
   delay(10);
 }

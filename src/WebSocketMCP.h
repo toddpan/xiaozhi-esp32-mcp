@@ -1,287 +1,232 @@
-
-
 #ifndef WEBSOCKET_MCP_H
 #define WEBSOCKET_MCP_H
 
+/**
+ * @file WebSocketMCP.h
+ * @brief WebSocket client for Model Context Protocol (MCP), optimized for XiaoZhi.ai.
+ * 
+ * Features:
+ * - Full RFC 6455 WebSocket framing (client-side masking, ping/pong, close).
+ * - JSON-RPC 2.0 message handling (tool_call, tool_response, initialize).
+ * - Built-in TLS support with XiaoZhi root CA certificate (no external secrets needed).
+ * - Automatic token persistence via NVS (non-volatile storage).
+ * - Agent-based activation flow: pair device using 6-digit agent code.
+ * 
+ * Designed for ESP32 with minimal heap usage:
+ * - No String class in hot paths.
+ * - All buffers are static (stack or member arrays).
+ * - Zero dynamic allocation after setup.
+ */
+
 #include <Arduino.h>
-#include <WiFi.h>
-#include <WebSocketsClient.h>
-#include <ArduinoJson.h>  // This library needs to be added to parse JSON
-#include <vector>
+#include <Client.h>
 #include <functional>
+#include <vector>
 
-/* *
- * WebSocketMCP Class
- * Encapsulates WebSocket connection and communication with MCP server */
-class WebSocketMCP {
+// Buffer size limits (adjust if needed, but keep conservative for ESP32-S3)
+#define MAX_URL_LENGTH      128   // Max hostname length
+#define MAX_PATH_LENGTH     512    // Max endpoint path length
+#define MAX_MESSAGE_LENGTH  1024  // Max incoming JSON/tool response size
+
+
+/**
+ * @brief Lightweight response wrapper for tool callbacks.
+ * 
+ * Stores only success/failure flag and a pointer to a static JSON string.
+ * Avoids heap allocation and copy overhead.
+ */
+class ToolResponse {
 public:
-  // Define the tool response content structure
-  //Sending to WebSocket: {"jsonrpc":"2.0","id":48,"result":{"content":[{"type":"text","text":"{\n  \"success\": true,\n  \"result\": 2\n}"}],"isError":false}}
-  struct ToolContentItem {
-    String type;  // Content type, such as "text"
-    String text;  // Text content
-  };
-  
-  // Define tool response structure
-  struct ToolResponse {
-    std::vector<ToolContentItem> content;  // Response content array
-    bool isError;                          // Is it an error response
-    
-    // Constructor: Create a response from a single text content
-    ToolResponse(const String& textContent, bool error = false) {
-      ToolContentItem item;
-      item.type = "text";
-      
-      // Try to detect if it is JSON and format it (by finding the beginning { and ending })
-      String trimmedText = textContent;
-      trimmedText.trim();
-      
-      if (trimmedText.startsWith("{") && trimmedText.endsWith("}")) {
-        // FormatJsonString method using WebSocketMCP
-        // Since this is within a static method, we need to create a temporary instance to call a non-static method
-        WebSocketMCP* instance = WebSocketMCP::instance;
-        if (instance) {
-          item.text = instance->formatJsonString(textContent);
-        } else {
-          item.text = textContent;
-        }
-      } else {
-        item.text = textContent;
-      }
-      
-      content.push_back(item);
-      isError = error;
-    }
+    /**
+     * @param err True if an error occurred (tool should return error response).
+     * @param msg Pointer to static JSON string (e.g., "{\"success\":true}").
+     *            Must remain valid after return (use literals or static storage).
+     */
+    ToolResponse(bool err = false, const char* msg = nullptr);
 
-    // New constructor: used to handle parameters of bool and String types
-    ToolResponse(bool error, const String& message) {
-      ToolContentItem item;
-      item.type = "text";
-      item.text = message;
-      content.push_back(item);
-      isError = error;
-    }
-    
-    // Default constructor
-    ToolResponse() : isError(false) {}
-    
-    // Create a response from a JSON object (convenient method)
-    static ToolResponse fromJson(const JsonObject& json, bool error = false) {
-      String jsonStr;
-      serializeJson(json, jsonStr);
-      return ToolResponse(jsonStr, error);
-    }
-  };
-
-  // Auxiliary class for parameter processing
-  class ToolParams {
-  public:
-    ToolParams(const String& json) {
-      DeserializationError error = deserializeJson(doc, json);
-      valid = !error;
-    }
-
-    // NEW: Static factory method from JsonVariantConst
-    // This creates a new ToolParams instance by serializing the variant and re-parsing it.
-    // Useful for handling items from JsonArray or nested JsonObjects reliably.
-    static ToolParams fromVariant(const JsonVariantConst& variant) {
-      String variantJson;
-      serializeJson(variant, variantJson);
-      return ToolParams(variantJson);
-    }
-    
-    template<typename T>
-    T get(const String& key, T defaultValue) const {
-      if (!valid || !doc.is<JsonObject>() || !doc.as<JsonObjectConst>().containsKey(key)) {
-        return defaultValue;
-      }
-      return doc.as<JsonObjectConst>()[key].as<T>();
-    }
-    
-    JsonVariantConst getJsonValue(const String& key) const {
-      if (!valid || !doc.is<JsonObject>() || !doc.as<JsonObjectConst>().containsKey(key)) {
-        return JsonVariantConst();
-      }
-      return doc.as<JsonObjectConst>()[key];
-    }
-    
-    JsonArrayConst getJsonArray(const String& key) const {
-      if (!valid || !doc.is<JsonObject>() || !doc.as<JsonObjectConst>().containsKey(key) || !doc.as<JsonObjectConst>()[key].is<JsonArray>()) {
-        return JsonArrayConst();
-      }
-      return doc.as<JsonObjectConst>()[key].as<JsonArrayConst>();
-    }
-    
-    bool isArray(const String& key) const {
-      if (!valid || !doc.is<JsonObject>() || !doc.as<JsonObjectConst>().containsKey(key)) {
-        return false;
-      }
-      return doc.as<JsonObjectConst>()[key].is<JsonArray>();
-    }
-    
-    size_t getArraySize(const String& key) const {
-      if (!valid || !doc.is<JsonObject>() || !doc.as<JsonObjectConst>().containsKey(key) || !doc.as<JsonObjectConst>()[key].is<JsonArray>()) {
-        return 0;
-      }
-      return doc.as<JsonObjectConst>()[key].as<JsonArrayConst>().size();
-    }
-
-    // NEW: Method to check if the root of this ToolParams' document is a JSON object
-    bool isJsonObject() const {
-      return valid && doc.is<JsonObject>();
-    }
-
-    // NEW: Method to check if the root of this ToolParams' document is a JSON array
-    bool isJsonArray() const {
-      return valid && doc.is<JsonArray>();
-    }
-
-    // NEW: Method to get the root as a JsonObjectConst if it is one
-    JsonObjectConst getAsJsonObject() const {
-      if (isJsonObject()) {
-        return doc.as<JsonObjectConst>();
-      }
-      return JsonObjectConst(); // Returns a null JsonObjectConst
-    }
-
-    // NEW: Method to get the root as a JsonArrayConst if it is one
-    JsonArrayConst getAsJsonArray() const {
-      if (isJsonArray()) {
-        return doc.as<JsonArrayConst>();
-      }
-      return JsonArrayConst(); // Returns a null JsonArrayConst
-    }
-    
-    bool contains(const String& key) const {
-      return valid && doc.is<JsonObject>() && doc.as<JsonObjectConst>().containsKey(key);
-    }
-    
-    String getDebugJson() const {
-      String result;
-      if (valid) {
-        serializeJson(doc, result);
-      } else {
-        result = "{\"error\":\"Invalid JSON document in ToolParams\"}";
-      }
-      return result;
-    }
-    
-    bool isValid() const {
-      return valid;
-    }
-    
-  private:
-    DynamicJsonDocument doc{2048}; // Adjust size as needed
-    bool valid = false;
-  };
-
-  // Redefine the tool callback function type - receive JSON string parameters and return the ToolResponse structure
-  typedef std::function<ToolResponse(const String&)> ToolCallback; // Change to Receive ToolParams&
-
-  // Callback type definition
-  // Output callback: void(const String&)
-  typedef void (*OutputCallback)(const String&);
-  // Error callback: void(const String&)
-  typedef void (*ErrorCallback)(const String&);
-  // Connection status callback: void(bool)
-  typedef void (*ConnectionCallback)(bool);
-
-  WebSocketMCP();
-
-  /* *
-   * Initialize the WebSocket connection
-   * @param mcpEndpoint WebSocket server address (ws://host:port/path)
-   * @param outputCb output data callback function (equivalent to stdout)
-   * @param errorCb error message callback function (equivalent to stderr)
-   * @param connCb Connection state change callback function
-   * @return Whether the initialization is successful
-   *
-   * Note: The connection uses the following timeout settings:
-   * - PING_INTERVAL: Heartbeat ping interval, default is 45 seconds
-   * - DISCONNECT_TIMEOUT: Disconnect timeout, default is 60 seconds
-   * - INITIAL_BACKOFF: The initial reconnection wait time is 1 second by default
-   * - MAX_BACKOFF: Maximum reconnection waiting time, default is 60 seconds */
-  bool begin(const char *mcpEndpoint, ConnectionCallback connCb = nullptr);
-
-  /* *
-   * Send data to the WebSocket server (equivalent to stdin)
-   * @param message message to send
-   * @return Whether the sending is successful */
-  bool sendMessage(const String &message);
-
-  /* *
-   * Handle WebSocket events and keep connections
-   * Need to be called frequently in the main loop */
-  void loop();
-
-  /* *
-   * Whether it is connected to the server
-   * @return Connection status */
-  bool isConnected();
-
-  /* *
-   * Disconnect */
-  void disconnect();
-
-  /* *
-   * Set log level and callback function
-   * @param level Log level
-   * @param logCb log callback function */
-
-  // Tool registration and management methods
-  bool registerTool(const String &name, const String &description, const String &inputSchema, ToolCallback callback);
-  // Simplify tool registration API
-  bool registerSimpleTool(const String &name, const String &description, 
-                         const String &paramName, const String &paramDesc, 
-                         const String &paramType, ToolCallback callback);
-  
-  bool unregisterTool(const String &name);
-  size_t getToolCount();
-  void clearTools();
+    bool isValid() const { return true; }   // Always valid — caller handles parsing
+    bool isError() const { return _error; }
+    const char* c_str() const { return _message; }
 
 private:
-  WebSocketsClient webSocket;
-  ConnectionCallback connectionCallback;
+    bool _error;
+    const char* _message; // Points to string literal or static buffer
+};
 
-  bool connected;
-  unsigned long lastReconnectAttempt;
+// Callback type for tool invocation: receives JSON args as C-string
+typedef std::function<ToolResponse(const char*)> ToolCallback;
+typedef void (*ConnectionCallback)(bool connected);
 
-  // Reconnect settings
-  static const int INITIAL_BACKOFF = 1000; // Initial waiting time (milliseconds)
-  static const int MAX_BACKOFF = 60000;    // Maximum waiting time (milliseconds)
-  static const int PING_INTERVAL = 10000;  // ping sending interval (milliseconds)
-  static const int DISCONNECT_TIMEOUT = 60000; // Disconnect timeout (milliseconds)
-  int currentBackoff;
-  int reconnectAttempt;
+// External declaration of XiaoZhi root CA (defined in .cpp to avoid header bloat)
+extern const char XIAOZHI_ROOT_CA[];
 
-  // WebSocket event handling function
-  static void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
-  static WebSocketMCP *instance;
+/**
+ * @brief WebSocket client for Model Context Protocol (MCP).
+ * 
+ * Supports two usage modes:
+ * 
+ * 1. Standard mode (manual token):
+ *      mcp.begin("wss://api.xiaozhi.me/mcp/?token=...");
+ * 
+ * 2. XiaoZhi activation mode (recommended):
+ *      mcp.beginWithAgentCode("Fx5L4pDZqw"); // 6-digit agent code from device
+ *    → Device connects to /mcp, sends `initialize`, receives JWT token,
+ *      saves it to NVS, and reconnects automatically.
+ * 
+ * Thread-safe for FreeRTOS: call loop() from a dedicated task.
+ */
+class WebSocketMCP {
+public:
+    /**
+     * @brief Constructor — binds to a pre-allocated Client (e.g., WiFiClientSecure).
+     * @param client Reference to network client. Must outlive this instance.
+     */
+    explicit WebSocketMCP(Client& client);
 
-  // Reconnect processing
-  void handleReconnect();
-  void resetReconnectParams();
+    // === Standard MCP Interface (backward-compatible) ===
+    
+    /**
+     * @brief Initialize connection using a full WebSocket endpoint.
+     * @param mcpEndpoint WebSocket URL (e.g., "wss://api.xiaozhi.me/mcp/?token=...")
+     *                    If nullptr, loads token from NVS and uses default XiaoZhi endpoint.
+     * @param connCb Optional callback for connection state changes.
+     * @return true if URL parsed successfully (does not guarantee network connect).
+     */
+    bool begin(const char* mcpEndpoint, ConnectionCallback connCb = nullptr);
 
-  // New members
-  unsigned long lastPingTime = 0;
-  void handleJsonRpcMessage(const String &message);
 
-  // Tool structure definition
-  struct Tool {
-    String name;           // Tool name
-    String description;    // Tool Description
-    String inputSchema;    // Tool input schema (JSON format)
-    ToolCallback callback; // Tool calls callback functions
-  };
+    // === XiaoZhi Activation Flow (recommended for new deployments) ===
+    
+    /**
+     * @brief Activate device using 6-digit agent code (e.g., "Fx5L4pDZqw").
+     *        This initiates the XiaoZhi pairing flow:
+     *        1. Connects to wss://api.xiaozhi.me/mcp (no token)
+     *        2. Sends JSON-RPC `initialize` with agent_code
+     *        3. Waits for `accessToken` in response
+     *        4. Saves token to NVS under namespace "xiaozhi"
+     *        5. Reconnects automatically using the new token
+     * @param agentCode 6-digit alphanumeric code from XiaoZhi device dashboard.
+     * @param connCb Callback for connection events (called on initial + reconnection).
+     * @return true if activation flow started successfully.
+     */
+    bool beginWithAgentCode(const char* agentCode, ConnectionCallback connCb = nullptr);
+	bool activateWithAgentCode(const char* agentCode);
+    /**
+     * @brief Check if device is already activated (token exists in NVS).
+     * @return true if a valid JWT token is stored and ready for use.
+     */
+    bool isActivated();
 
-  // Tool list
-  std::vector<Tool> _tools;
+    /**
+     * @brief Erase stored token from NVS (e.g., for factory reset or re-pairing).
+     */
+    void clearActivation();
 
-  // Auxiliary methods
-  String escapeJsonString(const String &input);
-  
-  // Format JSON strings, each key-value pair takes up one line
-  String formatJsonString(const String &jsonStr);
+    // === Core MCP Methods ===
+    
+    /**
+     * @brief Send a JSON-RPC message (tool_call, notification, etc.).
+     * @param message C-string containing JSON.
+     * @param length Length of message (avoids strlen).
+     * @return true if frame was queued for sending (does not guarantee delivery).
+     */
+    bool sendMessage(const char* message, size_t length);
+
+    /**
+     * @brief Process network events, handle reconnection, keep-alive.
+     *        Must be called repeatedly (e.g., in a FreeRTOS task loop).
+     */
+    void loop();
+
+    /**
+     * @return true if WebSocket handshake completed and connection is active.
+     */
+    bool isConnected();
+
+    /**
+     * @brief Gracefully close connection (sends CLOSE frame, stops client).
+     */
+    void disconnect();
+
+    // === Tool Management (MCP Protocol) ===
+    
+    /**
+     * @brief Register a tool that the LLM can invoke.
+     * @param name Tool name (e.g., "report_result").
+     * @param description Human-readable description (for LLM prompt).
+     * @param inputSchema JSON Schema string for input validation.
+     * @param callback Function to execute when tool is called.
+     * @return true on success.
+     */
+    bool registerTool(const char* name, const char* description,
+                      const char* inputSchema, ToolCallback callback);
+
+    bool unregisterTool(const char* name);
+	bool saveTokenToNVS(const char* token);
+    size_t getToolCount();
+    void clearTools();
+
+private:
+    // Connection state machine
+    enum WsState {
+        WS_DISCONNECTED,
+        WS_HANDSHAKING,
+        WS_CONNECTED
+    };
+
+    Client* _injectedClient;
+    WsState _currentState;
+
+    // Parsed connection parameters
+    char _host[MAX_URL_LENGTH];
+    uint16_t _port;
+    char _path[MAX_PATH_LENGTH];
+    bool _isSecure;
+	char _sessionId[64] = {0}; 
+
+    // Reconnection backoff strategy
+    ConnectionCallback _connectionCallback;
+    bool _connected;
+    unsigned long _lastReconnectAttempt;
+    static const int INITIAL_BACKOFF;   // 1000 ms
+    static const int MAX_BACKOFF;       // 60000 ms
+    static const int PING_INTERVAL;     // 10000 ms
+    static const int DISCONNECT_TIMEOUT; // 60000 ms
+    int _currentBackoff;
+    int _reconnectAttempt;
+    unsigned long _lastPingTime;
+
+    // Incoming message buffer (reused for each frame)
+    char _receiveBuffer[MAX_MESSAGE_LENGTH];
+
+    // Registered tools (MCP protocol)
+    struct Tool {
+        const char* name;
+        const char* description;
+        const char* inputSchema;
+        ToolCallback callback;
+    };
+    std::vector<Tool> _tools;
+
+    // Internal protocol methods
+    bool performHandshake();
+    bool sendWebSocketFrame(const char* data, size_t length, bool isText);
+    size_t receiveWebSocketFrame();
+    void processReceivedData();
+    void handleReconnect();
+    void resetReconnectParams();
+    void handleJsonRpcMessage(const char* message, size_t length);
+	bool parseActivationResponse(const String& jsonStr);
+
+    // NVS helpers (private implementation — no Preferences.h in header)
+    String loadTokenFromNVS();
+    
+
+    // Activation state during beginWithAgentCode()
+    bool _awaitingActivation;
+    char _pendingAgentCode[16]; // Holds agent code during activation handshake
+	int _activationRetryCount; 
+	static const int MAX_ACTIVATION_RETRIES = 3;
 };
 
 #endif // WEBSOCKET_MCP_H
